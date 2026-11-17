@@ -1,1 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Psycho Tropical</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#100d18;color:#fff6df;font-family:system-ui,sans-serif}
+main{max-width:1250px;margin:auto;padding:clamp(12px,3vw,34px)}
+header{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:18px}
+h1{margin:0;color:#ff885b;font-size:clamp(33px,6vw,76px);font-weight:950;letter-spacing:-.075em;line-height:.92;text-transform:uppercase}
+button,select{font:inherit;color:inherit;background:#211828;border:1px solid #63415f;border-radius:8px;padding:.65em .8em;cursor:pointer}
+button:hover,select:hover{border-color:#ffa477}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #b2f685;outline-offset:3px}
+button:disabled{opacity:.55;cursor:wait}
+#mic{background:#ff885b;color:#1e101c;border-color:transparent;font-weight:850}
+#stage{position:relative;overflow:hidden;background:#140d24;border:1px solid #4c304e;border-radius:14px}
+canvas{display:block;width:100%;height:clamp(340px,63vh,740px)}
+#stage:fullscreen,#stage.theater{border:0;border-radius:0;background:#080712}
+#stage:fullscreen canvas,#stage.theater canvas{height:100%}
+#stage.theater{position:fixed;inset:0;z-index:5}
+#exit{display:none;position:absolute;right:12px;top:12px}
+#stage:fullscreen #exit,#stage.theater #exit{display:block}
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:15px 0 7px}
+label{display:inline-flex;align-items:center;gap:8px;color:#e8c8e2;font-size:.9rem}
+input[type=range]{width:88px;accent-color:#ff885b}
+.status{display:flex;align-items:center;gap:10px;min-height:38px;color:#e8c8e2;font-size:.9rem}
+#signal{width:52px;height:6px;flex:none;background:#33243a;border-radius:9px;overflow:hidden}
+#level{display:block;width:100%;height:100%;background:#b2f685;transform-origin:left;transform:scaleX(0)}
+</style>
+</head>
+<body>
+<main>
+<header><h1>Psycho Tropical</h1><button id="full">Fullscreen</button></header>
+<div id="stage"><canvas aria-label="Animated music visualizer"></canvas><button id="exit">Exit fullscreen</button></div>
+<section class="controls" aria-label="Visualizer controls">
+<button id="mic">Start mic</button><button id="demo" aria-pressed="true">Demo</button>
+<label>Scene <select id="scene"><option>Acid Garden</option><option>Dub Lagoon</option><option>Sun Melt</option></select></label>
+<label>Sensitivity <input id="gain" type="range" min=".4" max="2.8" step=".1" value="1.2"></label>
+<label>Motion <input id="motion" type="range" min="0" max="1.6" step=".05" value=".9"></label>
+</section>
+<div class="status"><span id="signal" aria-hidden="true"><i id="level"></i></span><span id="status" role="status">Demo playing · Start mic to react to your room</span></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const stage = $('stage'), canvas = stage.querySelector('canvas'), ctx = canvas.getContext('2d');
+const mic = $('mic'), demo = $('demo'), status = $('status');
+const tau = Math.PI * 2;
+const clamp = (x, max = 1) => Math.min(max, Math.max(0, x));
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+if (reduced) $('motion').value = '.25';
+let width, height, context, stream, analyser, spectrum, waveform, bands;
+let mode = 'demo', request = 0, version = 0;
 
+function resize() {
+  const ratio = Math.min(devicePixelRatio || 1, 1.75);
+  width = canvas.clientWidth;
+  height = canvas.clientHeight;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+}
+new ResizeObserver(resize).observe(canvas);
+resize();
+
+function stopAudio() {
+  version++;
+  request = 0;
+  stream?.getTracks().forEach(track => track.stop());
+  context?.close().catch(() => {});
+  stream = context = analyser = null;
+}
+function setMode(next, message) {
+  mode = next;
+  mic.disabled = false;
+  mic.textContent = next === 'live' ? 'Stop mic' : 'Start mic';
+  demo.setAttribute('aria-pressed', String(next === 'demo'));
+  status.textContent = message;
+}
+demo.onclick = () => {
+  stopAudio();
+  setMode('demo', 'Demo playing · Start mic to react to your room');
+};
+mic.onclick = async () => {
+  if (mode === 'live') {
+    stopAudio();
+    setMode('idle', 'Mic off · Start mic or choose Demo');
+    return;
+  }
+  const Audio = window.AudioContext || window.webkitAudioContext;
+  if (!navigator.mediaDevices?.getUserMedia || !Audio) {
+    setMode('demo', 'Mic unavailable here · Open on HTTPS or localhost');
+    return;
+  }
+  const attempt = ++version;
+  request = attempt;
+  mic.disabled = true;
+  status.textContent = 'Waiting for microphone access…';
+  try {
+    context = new Audio();
+    const inputContext = context;
+    const resumed = inputContext.resume();
+    // Attach a rejection handler immediately while the permission dialog is open.
+    resumed.catch(() => {});
+    const input = await navigator.mediaDevices.getUserMedia({
+      audio: {echoCancellation:false, noiseSuppression:false, autoGainControl:false}
+    });
+    if (request !== attempt) {
+      input.getTracks().forEach(track => track.stop());
+      return;
+    }
+    stream = input;
+    await resumed;
+    if (request !== attempt) return;
+    analyser = inputContext.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = .48;
+    spectrum = new Float32Array(analyser.frequencyBinCount);
+    waveform = new Float32Array(analyser.fftSize);
+    bands = [[38,165],[165,2100],[2100,8500]].map(([low,high]) =>
+      [Math.ceil(low * analyser.fftSize / inputContext.sampleRate),
+       Math.min(spectrum.length, Math.ceil(high * analyser.fftSize / inputContext.sampleRate))]
+    );
+    inputContext.createMediaStreamSource(input).connect(analyser);
+    input.getAudioTracks().forEach(track => track.addEventListener('ended', () => {
+      if (stream !== input) return;
+      stopAudio();
+      setMode('idle', 'Mic disconnected · Start mic to reconnect');
+    }));
+    setMode('live', 'Live mic · Audio stays on this device');
+  } catch (error) {
+    if (request !== attempt) return;
+    stopAudio();
+    setMode('demo', error.name === 'NotAllowedError'
+      ? 'Mic access blocked · Check browser permissions or use Demo'
+      : 'Mic unavailable · Check your input device or use Demo');
+  }
+};
+addEventListener('pagehide', () => {
+  stopAudio();
+  setMode('idle', 'Mic off · Start mic or choose Demo');
+});
+$('full').onclick = async () => {
+  try {
+    await stage.requestFullscreen();
+  } catch {
+    stage.classList.add('theater');
+  }
+  $('exit').focus();
+};
+$('exit').onclick = () => {
+  stage.classList.remove('theater');
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  $('full').focus();
+};
+addEventListener('keydown', e => {
+  if (e.key === 'Escape' && stage.classList.contains('theater')) $('exit').click();
+});
+
+const particles = Array.from({length:98}, (_, i) => ({
+  angle:i * 2.399963, depth:(i * .618034) % 1, size:1 + (i % 5) * .43
+}));
+let bass=0, mid=0, high=0, volume=0, clock=0, last=0, meterTime=0;
+function bandEnergy([start,end]) {
+  let sum = 0;
+  for (let i = start; i < end; i++) sum += 10 ** (spectrum[i] / 10);
+  return clamp(Math.sqrt(sum / Math.max(1,end-start)) * 19);
+}
+function signal(t) {
+  if (mode === 'live' && analyser) {
+    analyser.getFloatFrequencyData(spectrum);
+    analyser.getFloatTimeDomainData(waveform);
+    let sum = 0;
+    for (const sample of waveform) sum += sample * sample;
+    return [...bands.map(bandEnergy), clamp(Math.sqrt(sum / waveform.length) * 6)];
+  }
+  if (mode === 'demo') {
+    const beat = Math.exp(-7 * ((t * 1.9) % 1));
+    return [.22 + .66 * beat, .33 + .15 * Math.sin(t * 4.3),
+      .23 + .38 * Math.pow(.5 + .5 * Math.sin(t * 21), 5), .42 + .31 * beat];
+  }
+  return [0,0,0,0];
+}
+function draw(ms) {
+  requestAnimationFrame(draw);
+  if (!width || !height) return;
+  const dt = Math.min(.05, (ms - (last || ms)) / 1000);
+  last = ms;
+  const g = Number($('gain').value), speed = Number($('motion').value);
+  const [b,m,h,v] = signal(ms / 1000);
+  const smoothing = 1 - Math.exp(-12 * dt);
+  bass += (clamp(b*g)-bass)*smoothing;
+  mid += (clamp(m*g)-mid)*smoothing;
+  high += (clamp(h*g)-high)*smoothing;
+  volume += (clamp(v)-volume)*smoothing;
+  clock += dt * speed * (.64 + bass * .28);
+  if (ms - meterTime > 80) {
+    $('level').style.transform = `scaleX(${volume})`;
+    meterTime = ms;
+  }
+
+  const scene = $('scene').selectedIndex;
+  const hues = [[319,156,37],[186,267,143],[18,46,326]][scene];
+  const edge = Math.min(width,height), radius = edge * .45;
+  const x = width/2, y = height/2;
+  const t = clock, pulse = .23 * bass * Math.min(1,speed);
+  const glow = ctx.createRadialGradient(x,y,0,x,y,Math.hypot(x,y));
+  glow.addColorStop(0,`hsl(${hues[0]} 65% ${15+bass*7}%)`);
+  glow.addColorStop(.58,`hsl(${hues[1]} 58% 8%)`);
+  glow.addColorStop(1,'#080712');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0,0,width,height);
+  ctx.save();
+  ctx.translate(x,y);
+
+  for (const p of particles) {
+    const d = .16 + p.depth * 1.27;
+    const angle = p.angle + t * (.08 + p.depth * .09);
+    const r = radius * (d + pulse * .3);
+    ctx.fillStyle = `hsla(${hues[2]+p.depth*60},95%,73%,${.2+high*.55})`;
+    ctx.beginPath();
+    ctx.arc(Math.cos(angle)*r*1.38,Math.sin(angle)*r,p.size*(.65+high*.6),0,tau);
+    ctx.fill();
+  }
+
+  const lobes = [7,5,9][scene];
+  for (let ring=20;ring>=0;ring--) {
+    const depth = (ring+1)/21;
+    const r = radius * (.055+depth*.93) * (1+pulse);
+    ctx.beginPath();
+    for (let point=0;point<=240;point++) {
+      const a = point/240*tau;
+      const phase = t * (scene === 1 ? -.9 : 1) + depth * 5.6;
+      const petal = Math.sin(a*lobes + phase);
+      const ripple = Math.sin(a*(lobes*3) - phase*2);
+      const wave = r * (1 + (.14+mid*.17)*petal + (.023+high*.05)*ripple);
+      const angle = a + depth*.69 + Math.sin(t*.4)*.4;
+      const px = Math.cos(angle)*wave*(scene === 1 ? 1.18 : 1);
+      const py = Math.sin(angle)*wave;
+      if (point === 0) ctx.moveTo(px,py);
+      else ctx.lineTo(px,py);
+    }
+    ctx.closePath();
+    ctx.lineWidth = ring % 5 === 0 ? 2.5 : 1.15;
+    ctx.strokeStyle = `hsla(${hues[ring%3]+depth*44+t*12},96%,${55+high*14}%,${.42+depth*.47})`;
+    ctx.stroke();
+  }
+
+  // Curving fronds frame the spectrum without covering the center.
+  for (const side of [-1,1]) {
+    for (let frond=0;frond<7;frond++) {
+      const reach = edge * (.15 + frond*.045);
+      const origin = side * width*.49;
+      const tipY = -height*(.47-frond*.108);
+      const sway = Math.sin(t*.88+frond*.8) * edge * .042;
+      ctx.beginPath();
+      ctx.moveTo(origin,height*.46);
+      ctx.quadraticCurveTo(origin-side*reach*.95,tipY+edge*.18,
+        origin-side*(reach+sway+edge*pulse*.19),tipY);
+      ctx.strokeStyle = `hsla(${hues[1]+frond*8},90%,62%,${.24+mid*.38})`;
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
